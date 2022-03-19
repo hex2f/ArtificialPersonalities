@@ -1,14 +1,16 @@
-import { Message, User } from 'discord.js'
+import { Message } from 'discord.js'
 import { ApplicationCommandOptionTypes } from 'discord.js/typings/enums'
-import { Command } from '~/types/command'
-import log from '~/log'
+import { Command } from '../types/command.js'
+import log from '../log.js'
 import fs from 'fs/promises'
 import fsExists from 'fs.promises.exists'
 import path from 'path'
-import sha256 from 'sha256'
+import trainingQueue from '../training-queue.js'
 
-const dataPath = path.join(__dirname, '..', '..', '..', 'data')
+const dataPath = path.resolve('..', 'data')
 const personalitiesPath = path.join(dataPath, 'personalities')
+
+log(personalitiesPath)
 
 void fsExists(dataPath)
   .then(async exists => { if (!exists) await fs.mkdir(dataPath) })
@@ -20,57 +22,71 @@ export default {
   description: 'Create a new personality',
   options: [
     {
-      name: 'based_on',
-      description: 'The user to create the personality for',
-      type: ApplicationCommandOptionTypes.USER,
-      required: true
-    },
-    {
-      name: 'name',
-      description: 'The name of the personality',
-      type: ApplicationCommandOptionTypes.STRING,
-      required: false
-    },
-    {
-      name: 'avatar_url',
-      description: 'The avatar URL of the personality',
-      type: ApplicationCommandOptionTypes.STRING,
-      required: false
-    },
-    {
-      name: 'sample',
+      name: 'sample_size',
       description: 'How many messages to sample',
       type: ApplicationCommandOptionTypes.NUMBER,
-      required: false,
+      required: true,
       minValue: 100,
-      maxValue: 5000
+      maxValue: 25000
     }
   ],
   handler: async (interaction) => {
     const { channel, options } = interaction
-    if (!channel) return
+    if (!interaction.channel || !channel || channel.type !== 'GUILD_TEXT') return
 
-    const user = options.getUser('based_on') as User
-    const name = options.getString('name') ?? user.username
-    const avatarUrl = options.getString('avatar_url') ?? user.avatarURL()
     const sample = options.getNumber('sample') ?? 1000
 
-    await interaction.reply(`Creating personality for ${user.username}...`)
+    if (await fsExists(path.join(personalitiesPath, `${channel.id}.json`))) {
+      await interaction.reply({
+        embeds: [
+          {
+            title: '<:icons_Wrong:859388130636988436> Personality already exists.',
+            description: 'A personality already exists for this server. Please delete it before creating a new one.',
+            color: 0xf73920
+          }
+        ]
+      })
+      return
+    }
+
+    await interaction.reply({
+      embeds: [
+        {
+          title: '<:icons_settings:859388128040976384> Configuring personality...',
+          color: 0x5b9ef0
+        }
+      ]
+    })
+
+    const statusMsg = await interaction.fetchReply() as Message
+
+    function progressBar (percent: number): string {
+      return `\`[${'■'.repeat(Math.ceil(percent / 5))}${' '.repeat(20 - Math.floor(percent / 5))}]\` ${Math.floor(percent)}%`
+    }
 
     // eslint-disable-next-line no-async-promise-executor
     const messages = await new Promise<any[]>(async (resolve, reject) => {
       const messages: any[] = []
       let lastMessageId: string | undefined
       const reportTimer: NodeJS.Timer = setInterval(() => {
-        void interaction.editReply(`${messages.length}/${sample} messages fetched...`)
+        void statusMsg.edit({
+          embeds: [
+            {
+              title: '<:icons_clouddown:860133546776985610> Collecting message samples...',
+              description: progressBar((messages.length / sample) * 100),
+              color: 0x5b9ef0
+            }
+          ]
+        })
       }, 5000)
       try {
         while (messages.length < sample) {
           const fetchedMessages = await channel.messages.fetch({ limit: 100, before: lastMessageId })
           if (fetchedMessages.size === 0) break
-          const messageArray = Array.from(fetchedMessages.values()).filter(m => m.content.length > 0)
-          messages.push(...messageArray.slice(5).filter(m => m.author.id === user.id).map((m: Message, i: number) => ({
+          const messageArray = Array.from(fetchedMessages.values()).filter(m => m.content.length > 0).reverse()
+          messages.push(...messageArray.map((m: Message, i: number) => ({
             content: m.content,
+            author: m.author.username,
             context: messageArray.slice(i - 5, i).map(m => ({ content: m.content, author: m.author.username }))
           })))
           lastMessageId = fetchedMessages.last()?.id
@@ -82,18 +98,26 @@ export default {
       resolve(messages)
     })
 
-    await interaction.editReply('Samples have been collected. Once training has finished in the background, the personality will automatically be activated. This may take several hours.')
+    await statusMsg.edit({
+      embeds: [
+        {
+          title: '<:icons_spark:860123643722727444> Samples collected. Training personality...',
+          color: 0x5b9ef0
+        }
+      ]
+    })
+
+    const filePath = path.join(personalitiesPath, `${channel.id}.json`)
 
     const personality = {
-      name: name,
-      avatarUrl: avatarUrl,
-      basedOn: { name: user.username, id: user.id },
-      hash: sha256(user.username + name),
-      messages: messages
+      messages: messages,
+      filePath,
+      channelId: channel.id,
+      statusMsgId: statusMsg.id
     }
 
-    const filePath = path.join(personalitiesPath, `${personality.hash}.json`)
-
     await fs.writeFile(filePath, JSON.stringify(personality))
+
+    void trainingQueue.push(channel.id, statusMsg)
   }
 } as Command
